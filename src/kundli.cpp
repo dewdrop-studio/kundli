@@ -11,7 +11,7 @@ namespace fs = std::filesystem;
 
 unique_ptr<Archive> Archive::create() {
   auto archive = unique_ptr<Archive>(new Archive());
-  strncpy(reinterpret_cast<char *>(archive->header.magic), ARCHIVE_MAGIC, 7);
+  strncpy(reinterpret_cast<char *>(archive->header.magic), ARCHIVE_MAGIC, 5);
   archive->header.version = ARCHIVE_VERSION;
   archive->header.flags = static_cast<u8>(ArchiveFlag::None);
   archive->header.timestamp = static_cast<u64>(time(nullptr));

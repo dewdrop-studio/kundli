@@ -15,7 +15,7 @@ using s16 = std::int16_t;
 using s32 = std::int32_t;
 using s64 = std::int64_t;
 
-constexpr const char *ARCHIVE_MAGIC = "KUNDLI";
+constexpr const char *ARCHIVE_MAGIC = "KNDL";
 constexpr u8 ARCHIVE_VERSION = 1;
 
 enum class ArchiveFlag : u8 {
@@ -25,7 +25,7 @@ enum class ArchiveFlag : u8 {
 };
 
 struct ArchiveHeader {
-  u8 magic[7]{};   // Magic number to identify the archive format
+  u8 magic[4]{};   // Magic number to identify the archive format
   u8 version{};    // Version of the archive format
   u8 flags{};      // Bitmask of ArchiveFlag
   u64 timestamp{}; // Timestamp of the archive creation
