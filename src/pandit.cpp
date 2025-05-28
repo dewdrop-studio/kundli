@@ -117,6 +117,7 @@ private:
                 archive_path.c_str());
         std::exit(EXIT_FAILURE);
       }
+      archive->decompress();
       break;
 
     case Operation::List:

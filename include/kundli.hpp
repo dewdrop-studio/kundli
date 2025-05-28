@@ -25,9 +25,10 @@ enum class ArchiveFlag : u8 {
 };
 
 struct ArchiveHeader {
-  u8 magic[7]{};
-  u8 version{};
-  u8 flags{};
+  u8 magic[7]{};   // Magic number to identify the archive format
+  u8 version{};    // Version of the archive format
+  u8 flags{};      // Bitmask of ArchiveFlag
+  u64 timestamp{}; // Timestamp of the archive creation
 } __attribute__((packed));
 
 enum class FileType : u8 { Regular = 0, Directory, Symlink };
@@ -49,16 +50,20 @@ public:
   ~Archive();
 
   ArchiveFile *add_file(const std::string &path);
+  ArchiveFile *add_directory(const std::string &path);
+
   void remove_file(const std::string &path);
 
   void compress(const std::string &output_path) const;
-  void decompress(const std::string &input_path);
+  void decompress();
 
   void list_files() const;
   void print_info() const;
 
 private:
   Archive() = default;
+
+  void add_parent_directories(const std::string &path);
 
   ArchiveHeader header{};
   std::vector<ArchiveFile> files;
