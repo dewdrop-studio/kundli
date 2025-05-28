@@ -10,6 +10,7 @@ Kundli is a modern, efficient archive tool written in C++23 that allows you to c
 - **Directory Support**: Recursive directory archiving with automatic parent directory creation
 - **File Types**: Support for regular files, directories, and symbolic links
 - **Permission Preservation**: Maintains original file permissions (owner, group, others)
+- **CRC32 Integrity Check**: Detect archive corruption with CRC32 checksum validation
 - **Modern C++**: Built with C++23 features and best practices
 
 ## Installation
@@ -107,10 +108,11 @@ Kundli uses a custom binary format (`.kl`) with the following structure:
 ### Header Structure
 ```cpp
 struct ArchiveHeader {
-  u8 magic[4];     // "KNDL" magic bytes
+  u8 magic[5];     // "KNDL" magic bytes + null
   u8 version;      // Format version (currently 1)
   u8 flags;        // Archive flags
   u64 timestamp;   // Creation timestamp
+  u32 crc32;       // CRC32 checksum of data section
 } __attribute__((packed));
 ```
 
