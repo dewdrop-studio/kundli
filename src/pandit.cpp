@@ -1,10 +1,13 @@
 #include "kundli.hpp"
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <vector>
+
+constexpr const size_t DEFAULT_THREAD_COUNT = 4;
 
 class Config {
   public:
@@ -18,6 +21,9 @@ class Config {
     std::string archive_path{"comp.kl"};
     std::vector<std::string> files;
     bool verbose{false};
+    bool force_full_load{false};
+    bool use_parallel{false};
+    size_t thread_count{DEFAULT_THREAD_COUNT};
 
     enum class Operation : uint8_t {
         None,
@@ -44,6 +50,20 @@ class Config {
                 operation = Operation::Extend;
             } else if (arg == "-v" || arg == "--verbose") {
                 verbose = true;
+            } else if (arg == "--full-load") {
+                force_full_load = true;
+            } else if (arg == "-j" || arg == "--parallel") {
+                use_parallel = true;
+            } else if (arg == "-t" || arg == "--threads") {
+                if (i + 1 < argc) {
+                    thread_count = std::stoul(argv[++i]);
+                    use_parallel = true; // Enable parallel processing when
+                                         // threads specified
+                } else {
+                    std::cerr
+                        << "Error: --threads requires a number argument.\n";
+                    std::exit(EXIT_FAILURE);
+                }
             } else if (arg == "-i" || arg == "--info") {
                 operation = Operation::Info;
             } else if (arg == "-h" || arg == "--help") {
@@ -73,6 +93,11 @@ class Config {
         printf("  -e, --extend          Extend the archive with new files\n");
         printf("  -i, --info            Show archive information\n");
         printf("  -v, --verbose         Enable verbose output\n");
+        printf("  -j, --parallel        Enable parallel processing\n");
+        printf(
+            "  -t, --threads N       Use N threads for parallel operations\n");
+        printf("      --full-load       Force full loading (disable lazy "
+               "loading)\n");
         printf("  -h, --help            Show this help message\n");
         printf("  -V, --version         Show version information\n");
         printf("  -a, --archive <path>  Specify the archive path (default: "
@@ -108,6 +133,9 @@ class Config {
             }
             archive = Archive::create();
             archive->set_verbose(verbose);
+            if (thread_count > 0) {
+                archive->set_thread_count(thread_count);
+            }
 
             for (const auto &file : files) {
                 if (!archive->add_file(file)) {
@@ -117,22 +145,36 @@ class Config {
                     std::exit(EXIT_FAILURE);
                 }
             }
-            archive->compress(archive_path);
+
+            if (use_parallel) {
+                archive->compress_parallel(archive_path, thread_count);
+            } else {
+                archive->compress(archive_path);
+            }
             break;
 
         case Operation::Decompress:
-            archive = Archive::load(archive_path);
+            archive = force_full_load ? Archive::load_full(archive_path)
+                                      : Archive::load(archive_path);
             if (!archive) {
                 fprintf(stderr, "Error: Failed to load archive '%s'.\n",
                         archive_path.c_str());
                 std::exit(EXIT_FAILURE);
             }
             archive->set_verbose(verbose);
+            if (thread_count > 0) {
+                archive->set_thread_count(thread_count);
+            }
 
-            archive->decompress();
+            if (use_parallel) {
+                archive->decompress_parallel(thread_count);
+            } else {
+                archive->decompress();
+            }
             break;
         case Operation::Extend:
-            archive = Archive::load(archive_path);
+            archive = force_full_load ? Archive::load_full(archive_path)
+                                      : Archive::load(archive_path);
             if (!archive) {
                 fprintf(stderr, "Error: Failed to load archive '%s'.\n",
                         archive_path.c_str());
@@ -144,6 +186,9 @@ class Config {
                 std::exit(EXIT_FAILURE);
             }
             archive->set_verbose(verbose);
+            if (thread_count > 0) {
+                archive->set_thread_count(thread_count);
+            }
             for (const auto &file : files) {
                 if (!archive->add_file(file)) {
                     fprintf(stderr,
@@ -152,11 +197,17 @@ class Config {
                     std::exit(EXIT_FAILURE);
                 }
             }
-            archive->compress(archive_path);
+
+            if (use_parallel) {
+                archive->compress_parallel(archive_path, thread_count);
+            } else {
+                archive->compress(archive_path);
+            }
             break;
 
         case Operation::List:
-            archive = Archive::load(archive_path);
+            archive = force_full_load ? Archive::load_full(archive_path)
+                                      : Archive::load(archive_path);
             if (!archive) {
                 fprintf(stderr, "Error: Failed to load archive '%s'.\n",
                         archive_path.c_str());
@@ -165,7 +216,8 @@ class Config {
             archive->list_files();
             break;
         case Operation::Info:
-            archive = Archive::load(archive_path);
+            archive = force_full_load ? Archive::load_full(archive_path)
+                                      : Archive::load(archive_path);
             if (!archive) {
                 fprintf(stderr, "Error: Failed to load archive '%s'.\n",
                         archive_path.c_str());
