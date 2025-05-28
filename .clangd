@@ -1,0 +1,32 @@
+CompileFlags:
+  Add: 
+    - "-Wall"
+    - "-Wextra"
+  Remove: 
+    - "-W*"
+
+Diagnostics:
+  ClangTidy:
+    Add: 
+      - performance*
+      - bugprone*
+  UnusedIncludes: Strict
+
+InlayHints:
+  Enabled: true
+  ParameterNames: true
+  DeducedTypes: true
+  Designators: true
+
+Hover:
+  ShowAKA: true
+
+Index:
+  Background: Build
+  StandardLibrary: Yes
+
+Completion:
+  AllScopes: true
+
+Style:
+  FullyQualifiedNamespaces: false
