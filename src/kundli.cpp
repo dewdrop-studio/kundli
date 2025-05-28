@@ -10,6 +10,17 @@
 using namespace std;
 namespace fs = std::filesystem;
 
+u32 crc32(const u8* data, size_t length) {                      //
+    u32 crc = 0xFFFFFFFF;                                       //
+    for (size_t i = 0; i < length; ++i) {                       //                      
+        crc ^= data[i];                                         //
+        for (int j = 0; j < 8; ++j) {                           //                
+            crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));     //
+        }                                                       //                            
+    }                                                           //                       
+    return ~crc;                                                //
+}                                                               //
+
 unique_ptr<Archive> Archive::create() {
   auto archive = unique_ptr<Archive>(new Archive());
   strncpy(reinterpret_cast<char *>(archive->header.magic), ARCHIVE_MAGIC, 5);
@@ -65,6 +76,12 @@ unique_ptr<Archive> Archive::load(const string &path) {
   file.read(reinterpret_cast<char *>(&data_size), sizeof(data_size));
   archive->data.resize(data_size);
   file.read(reinterpret_cast<char *>(archive->data.data()), data_size);
+
+  u32 actual_crc = crc32(archive->data.data(), archive->data.size());   //
+  if (archive->header.crc32 != actual_crc) {                            //
+    cerr << "Archive CRC32 mismatch! The archive may be corrupted.\n";  //
+    return nullptr;                                                     //
+  }                                                                    //                             
 
   return archive;
 }
@@ -286,13 +303,16 @@ void Archive::remove_file(const string &path) {
 }
 
 void Archive::compress(const string &output_path) const {
+  ArchiveHeader header_copy = header;
+  header_copy.crc32 = crc32(data.data(), data.size());
+
   ofstream out(output_path, ios::binary);
   if (!out) {
     cerr << "Failed to open output: " << output_path << '\n';
     return;
   }
 
-  out.write(reinterpret_cast<const char *>(&header), sizeof(header));
+  out.write(reinterpret_cast<const char *>(&header_copy), sizeof(header_copy)); 
   u64 file_count = files.size();
   out.write(reinterpret_cast<const char *>(&file_count), sizeof(file_count));
 

@@ -29,6 +29,7 @@ struct ArchiveHeader {
   u8 version{};    // Version of the archive format
   u8 flags{};      // Bitmask of ArchiveFlag
   u64 timestamp{}; // Timestamp of the archive creation
+  u32 crc32{}; // testing purposes, CRC32 checksm
 } __attribute__((packed));
 
 enum class FileType : u8 { Regular = 0, Directory, Symlink };
