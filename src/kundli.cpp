@@ -1,6 +1,7 @@
 #include "kundli.hpp"
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -29,7 +30,7 @@ unique_ptr<Archive> Archive::load(const string &path) {
   file.read(reinterpret_cast<char *>(&archive->header), sizeof(ArchiveHeader));
 
   if (strncmp(reinterpret_cast<char *>(archive->header.magic), ARCHIVE_MAGIC,
-              6) != 0 ||
+              4) != 0 ||
       archive->header.version != ARCHIVE_VERSION) {
     cerr << "Invalid archive format or version mismatch.\n";
     return nullptr;
@@ -76,20 +77,37 @@ ArchiveFile *Archive::add_file(const string &path) {
     return nullptr;
   }
 
+  // Normalize the path
+  string normalized_path = normalize_path(path);
+
   // If it's a directory, branch to add_directory
-  if (fs::is_directory(path)) {
-    return add_directory(path);
+  if (fs::is_directory(normalized_path)) {
+    return add_directory(normalized_path);
+  }
+
+  // Check if this file is already in the archive
+  auto existing =
+      std::find_if(files.begin(), files.end(), [&](const ArchiveFile &f) {
+        return f.path == normalized_path && f.type != FileType::Directory;
+      });
+
+  if (existing != files.end()) {
+    if (verbose) {
+      cerr << "File already exists in archive, skipping: " << normalized_path
+           << '\n';
+    }
+    return &(*existing);
   }
 
   // Ensure all parent directories are added to the archive
-  add_parent_directories(path);
+  add_parent_directories(normalized_path);
 
   ArchiveFile file_entry;
-  file_entry.path = path;
-  file_entry.path_length = path.size();
+  file_entry.path = normalized_path;
+  file_entry.path_length = normalized_path.size();
   file_entry.offset = data.size();
 
-  auto perms = fs::status(path).permissions();
+  auto perms = fs::status(normalized_path).permissions();
   file_entry.permissions[0] =
       static_cast<u8>((static_cast<u32>(perms) >> 6) & 0b111); // owner
   file_entry.permissions[1] =
@@ -97,22 +115,22 @@ ArchiveFile *Archive::add_file(const string &path) {
   file_entry.permissions[2] =
       static_cast<u8>((static_cast<u32>(perms)) & 0b111); // others
 
-  if (fs::is_symlink(path)) {
+  if (fs::is_symlink(normalized_path)) {
     file_entry.type = FileType::Symlink;
     // For symlinks, store the target path as data
-    string target = fs::read_symlink(path).string();
+    string target = fs::read_symlink(normalized_path).string();
     file_entry.data_length = target.size();
     file_entry.size = file_entry.data_length + file_entry.path_length;
 
     data.insert(data.end(), target.begin(), target.end());
   } else {
     file_entry.type = FileType::Regular;
-    file_entry.data_length = fs::file_size(path);
+    file_entry.data_length = fs::file_size(normalized_path);
     file_entry.size = file_entry.data_length + file_entry.path_length;
 
-    ifstream file(path, ios::binary);
+    ifstream file(normalized_path, ios::binary);
     if (!file) {
-      cerr << "Failed to open: " << path << '\n';
+      cerr << "Failed to open: " << normalized_path << '\n';
       return nullptr;
     }
 
@@ -136,30 +154,37 @@ ArchiveFile *Archive::add_directory(const string &path) {
     return nullptr;
   }
 
+  // Normalize the path
+  string normalized_path = normalize_path(path);
+
   // Ensure all parent directories are added to the archive
-  add_parent_directories(path);
+  add_parent_directories(normalized_path);
 
   // Check if this directory is already in the archive
   auto existing =
       std::find_if(files.begin(), files.end(), [&](const ArchiveFile &f) {
-        return f.path == path && f.type == FileType::Directory;
+        return f.path == normalized_path && f.type == FileType::Directory;
       });
 
   if (existing != files.end()) {
     // Directory already exists, return pointer to it
+    if (verbose) {
+      cerr << "Directory already exists in archive, skipping: "
+           << normalized_path << '\n';
+    }
     return &(*existing);
   }
 
   // First, add the directory entry itself
   ArchiveFile dir_entry;
-  dir_entry.path = path;
-  dir_entry.path_length = path.size();
+  dir_entry.path = normalized_path;
+  dir_entry.path_length = normalized_path.size();
   dir_entry.type = FileType::Directory;
   dir_entry.data_length = 0;              // Directories have no data
   dir_entry.offset = data.size();         // Current position in data
   dir_entry.size = dir_entry.path_length; // Only path length for directories
 
-  auto perms = fs::status(path).permissions();
+  auto perms = fs::status(normalized_path).permissions();
   dir_entry.permissions[0] =
       static_cast<u8>((static_cast<u32>(perms) >> 6) & 0b111); // owner
   dir_entry.permissions[1] =
@@ -172,7 +197,7 @@ ArchiveFile *Archive::add_directory(const string &path) {
 
   // Recursively add all contents of the directory
   try {
-    for (const auto &entry : fs::directory_iterator(path)) {
+    for (const auto &entry : fs::directory_iterator(normalized_path)) {
       const string entry_path = entry.path().string();
 
       if (entry.is_directory()) {
@@ -182,7 +207,8 @@ ArchiveFile *Archive::add_directory(const string &path) {
       }
     }
   } catch (const fs::filesystem_error &e) {
-    cerr << "Error reading directory " << path << ": " << e.what() << '\n';
+    cerr << "Error reading directory " << normalized_path << ": " << e.what()
+         << '\n';
   }
 
   return result;
@@ -235,6 +261,18 @@ void Archive::add_parent_directories(const string &path) {
       }
     }
   }
+}
+
+string Archive::normalize_path(const string &path) {
+  fs::path normalized = fs::path(path).lexically_normal();
+  string result = normalized.string();
+
+  // Remove trailing slash for directories except root
+  if (result.length() > 1 && result.back() == '/') {
+    result.pop_back();
+  }
+
+  return result;
 }
 
 void Archive::remove_file(const string &path) {
@@ -405,7 +443,7 @@ void Archive::list_files() const {
 
 void Archive::print_info() const {
   cout << "Archive Info:\n";
-  cout << "Magic: " << string(reinterpret_cast<const char *>(header.magic), 7)
+  cout << "Magic: " << string(reinterpret_cast<const char *>(header.magic), 4)
        << '\n';
   cout << "Version: " << static_cast<int>(header.version) << '\n';
   cout << "Flags: " << static_cast<int>(header.flags) << '\n';

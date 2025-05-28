@@ -1,6 +1,7 @@
 #include "kundli.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -17,7 +18,6 @@ private:
   std::string archive_path{"comp.kl"};
   std::vector<std::string> files;
   bool verbose{false};
-  bool quiet{false};
 
   enum class Operation {
     None,
@@ -25,7 +25,8 @@ private:
     Version,
     Compress,
     Decompress,
-    List
+    List,
+    Extend
   } operation{Operation::None};
 
   void parseArguments(int argc, char **argv) {
@@ -38,10 +39,10 @@ private:
         operation = Operation::Decompress;
       } else if (arg == "-l" || arg == "--list") {
         operation = Operation::List;
+      } else if (arg == "-e" || arg == "--extend") {
+        operation = Operation::Extend;
       } else if (arg == "-v" || arg == "--verbose") {
         verbose = true;
-      } else if (arg == "-q" || arg == "--quiet") {
-        quiet = true;
       } else if (arg == "-h" || arg == "--help") {
         operation = Operation::Help;
       } else if (arg == "-V" || arg == "--version") {
@@ -50,7 +51,7 @@ private:
         if (i + 1 < argc) {
           archive_path = argv[++i];
         } else {
-          fprintf(stderr, "Error: --archive requires a path argument.\n");
+          std::cerr << "Error: --archive requires a path argument." << "\n";
           std::exit(EXIT_FAILURE);
         }
       } else {
@@ -65,8 +66,8 @@ private:
     printf("  -c, --compress        Compress files into an archive\n");
     printf("  -x, --extract         Extract files from an archive\n");
     printf("  -l, --list            List files in an archive\n");
+    printf("  -e, --extend          Extend the archive with new files\n");
     printf("  -v, --verbose         Enable verbose output\n");
-    printf("  -q, --quiet           Suppress output messages\n");
     printf("  -h, --help            Show this help message\n");
     printf("  -V, --version         Show version information\n");
     printf("  -a, --archive <path>  Specify the archive path (default: "
@@ -100,6 +101,8 @@ private:
         std::exit(EXIT_FAILURE);
       }
       archive = Archive::create();
+      archive->set_verbose(verbose);
+
       for (const auto &file : files) {
         if (!archive->add_file(file)) {
           fprintf(stderr, "Error: Failed to add file '%s' to archive.\n",
@@ -117,7 +120,31 @@ private:
                 archive_path.c_str());
         std::exit(EXIT_FAILURE);
       }
+      archive->set_verbose(verbose);
+
       archive->decompress();
+      break;
+    case Operation::Extend:
+      archive = Archive::load(archive_path);
+      if (!archive) {
+        fprintf(stderr, "Error: Failed to load archive '%s'.\n",
+                archive_path.c_str());
+        std::exit(EXIT_FAILURE);
+      }
+      if (files.empty()) {
+        fprintf(stderr, "Error: No files specified for extending.\n");
+        printHelp();
+        std::exit(EXIT_FAILURE);
+      }
+      archive->set_verbose(verbose);
+      for (const auto &file : files) {
+        if (!archive->add_file(file)) {
+          fprintf(stderr, "Error: Failed to add file '%s' to archive.\n",
+                  file.c_str());
+          std::exit(EXIT_FAILURE);
+        }
+      }
+      archive->compress(archive_path);
       break;
 
     case Operation::List:

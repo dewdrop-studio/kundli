@@ -25,7 +25,7 @@ enum class ArchiveFlag : u8 {
 };
 
 struct ArchiveHeader {
-  u8 magic[4]{};   // Magic number to identify the archive format
+  u8 magic[5]{};   // Magic number to identify the archive format (KNDL + '\0')
   u8 version{};    // Version of the archive format
   u8 flags{};      // Bitmask of ArchiveFlag
   u64 timestamp{}; // Timestamp of the archive creation
@@ -60,12 +60,16 @@ public:
   void list_files() const;
   void print_info() const;
 
+  void set_verbose(bool verbose) { this->verbose = verbose; }
+
 private:
   Archive() = default;
 
   void add_parent_directories(const std::string &path);
+  std::string normalize_path(const std::string &path);
 
   ArchiveHeader header{};
   std::vector<ArchiveFile> files;
   std::vector<u8> data;
+  bool verbose{false};
 };
