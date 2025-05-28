@@ -131,7 +131,6 @@ void Archive::compress(const string &output_path) const {
   u64 file_count = files.size();
   out.write(reinterpret_cast<const char *>(&file_count), sizeof(file_count));
 
-  // Write file entries properly (without the std::string)
   for (const auto &file_entry : files) {
     out.write(reinterpret_cast<const char *>(&file_entry.offset),
               sizeof(file_entry.offset));
