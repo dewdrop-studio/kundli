@@ -30,8 +30,6 @@
 using namespace std;
 namespace fs = std::filesystem;
 
-// Optimized CRC32 implementation with lookup table
-
 constexpr std::array<u32, 256> create_crc32_table() {
     std::array<u32, 256> table{};
 
@@ -48,7 +46,6 @@ constexpr std::array<u32, 256> crc32_table = create_crc32_table();
 
 u32 crc32(const u8 *data, size_t length) {
     u32 crc = 0xFFFFFFFF;
-
     for (size_t i = 0; i < length; ++i) {
         crc = crc32_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
     }
@@ -56,7 +53,6 @@ u32 crc32(const u8 *data, size_t length) {
     return ~crc;
 }
 
-// SIMD-optimized CRC32 implementation
 #ifdef __SSE4_2__
 bool has_sse4_2() {
     static bool checked = false;
@@ -72,7 +68,6 @@ bool has_sse4_2() {
     return supported;
 }
 
-// Hardware-accelerated CRC32 using SSE4.2 instructions
 u32 crc32_simd(const u8 *data, size_t length) {
     if (!has_sse4_2()) {
         return crc32(data, length); // Fallback to table-based version
@@ -103,7 +98,6 @@ u32 crc32_simd(const u8 *data, size_t length) {
 }
 #endif
 
-// Vectorized memory operations
 void *fast_memcpy(void *dest, const void *src, size_t n) {
 #ifdef __x86_64__
     if (n >= 32) {
@@ -139,18 +133,14 @@ void *fast_memcpy(void *dest, const void *src, size_t n) {
     return std::memcpy(dest, src, n);
 }
 
-// MappedFile implementation for memory mapping large archives
 Archive::MappedFile::~MappedFile() { unmap(); }
 
 bool Archive::MappedFile::map_file(const std::string &path) {
 #ifdef __unix__
-    // Open file for reading
     fd = open(path.c_str(), O_RDONLY);
     if (fd == -1) {
         return false;
     }
-
-    // Get file size
     struct stat st;
     if (fstat(fd, &st) == -1) {
         close(fd);
@@ -160,7 +150,7 @@ bool Archive::MappedFile::map_file(const std::string &path) {
 
     file_size = static_cast<size_t>(st.st_size);
 
-    // Memory map the file
+    // Map the file to a location in memory
     mapped_data = static_cast<u8 *>(
         mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0));
     if (mapped_data == MAP_FAILED) {
