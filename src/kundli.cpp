@@ -1,6 +1,8 @@
 #include "kundli.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -11,18 +13,267 @@
 #include <thread>
 #include <vector>
 
+// SIMD support
+#ifdef __x86_64__
+#include <cpuid.h>
+#include <immintrin.h>
+#endif
+
+// Memory mapping support
+#ifdef __unix__
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 using namespace std;
 namespace fs = std::filesystem;
 
-u32 crc32(const u8 *data, size_t length) {
-    u32 crc = 0xFFFFFFFF;
-    for (size_t i = 0; i < length; ++i) {
-        crc ^= data[i];
+// Optimized CRC32 implementation with lookup table
+
+constexpr std::array<u32, 256> create_crc32_table() {
+    std::array<u32, 256> table{};
+
+    for (u32 i = 0; i < 256; ++i) {
+        u32 crc = i;
         for (int j = 0; j < 8; ++j) {
             crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
         }
+        table[i] = crc;
     }
+    return table;
+}
+constexpr std::array<u32, 256> crc32_table = create_crc32_table();
+
+u32 crc32(const u8 *data, size_t length) {
+    u32 crc = 0xFFFFFFFF;
+
+    for (size_t i = 0; i < length; ++i) {
+        crc = crc32_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    }
+
     return ~crc;
+}
+
+// SIMD-optimized CRC32 implementation
+#ifdef __SSE4_2__
+bool has_sse4_2() {
+    static bool checked = false;
+    static bool supported = false;
+
+    if (!checked) {
+        unsigned int eax, ebx, ecx, edx;
+        if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
+            supported = (ecx & bit_SSE4_2) != 0;
+        }
+        checked = true;
+    }
+    return supported;
+}
+
+// Hardware-accelerated CRC32 using SSE4.2 instructions
+u32 crc32_simd(const u8 *data, size_t length) {
+    if (!has_sse4_2()) {
+        return crc32(data, length); // Fallback to table-based version
+    }
+
+    u32 crc = 0xFFFFFFFF;
+    const u8 *end = data + length;
+
+    // Process 8-byte chunks using hardware CRC32
+    while (data + 8 <= end) {
+        crc = _mm_crc32_u64(crc, *reinterpret_cast<const u64 *>(data));
+        data += 8;
+    }
+
+    // Process 4-byte chunk if available
+    if (data + 4 <= end) {
+        crc = _mm_crc32_u32(crc, *reinterpret_cast<const u32 *>(data));
+        data += 4;
+    }
+
+    // Process remaining bytes
+    while (data < end) {
+        crc = _mm_crc32_u8(crc, *data);
+        data++;
+    }
+
+    return ~crc;
+}
+#endif
+
+// Vectorized memory operations
+void *fast_memcpy(void *dest, const void *src, size_t n) {
+#ifdef __x86_64__
+    if (n >= 32) {
+        // Use AVX for large copies if available
+        const char *s = static_cast<const char *>(src);
+        char *d = static_cast<char *>(dest);
+
+        // Align to 32-byte boundary
+        while (((uintptr_t)d & 31) && n > 0) {
+            *d++ = *s++;
+            n--;
+        }
+
+        // Copy 32-byte chunks with AVX
+        while (n >= 32) {
+            __m256i data =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s));
+            _mm256_store_si256(reinterpret_cast<__m256i *>(d), data);
+            s += 32;
+            d += 32;
+            n -= 32;
+        }
+
+        // Copy remaining bytes
+        while (n > 0) {
+            *d++ = *s++;
+            n--;
+        }
+
+        return dest;
+    }
+#endif
+    return std::memcpy(dest, src, n);
+}
+
+// MappedFile implementation for memory mapping large archives
+Archive::MappedFile::~MappedFile() { unmap(); }
+
+bool Archive::MappedFile::map_file(const std::string &path) {
+#ifdef __unix__
+    // Open file for reading
+    fd = open(path.c_str(), O_RDONLY);
+    if (fd == -1) {
+        return false;
+    }
+
+    // Get file size
+    struct stat st;
+    if (fstat(fd, &st) == -1) {
+        close(fd);
+        fd = -1;
+        return false;
+    }
+
+    file_size = static_cast<size_t>(st.st_size);
+
+    // Memory map the file
+    mapped_data = static_cast<u8 *>(
+        mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0));
+    if (mapped_data == MAP_FAILED) {
+        mapped_data = nullptr;
+        close(fd);
+        fd = -1;
+        return false;
+    }
+
+    // We're gonna do sequential access,
+    // so advise the kernel to optimize for that
+    madvise(mapped_data, file_size, MADV_SEQUENTIAL);
+
+    return true;
+#else
+    // Memory mapping not supported on this platform ( Windows :/ )
+    return false;
+#endif
+}
+
+void Archive::MappedFile::unmap() {
+#ifdef __unix__
+    if (mapped_data != nullptr) {
+        munmap(mapped_data, file_size);
+        mapped_data = nullptr;
+    }
+    if (fd != -1) {
+        close(fd);
+        fd = -1;
+    }
+#endif
+    file_size = 0;
+}
+
+Archive::MemoryPool Archive::memory_pool;
+Archive::ThreadPool Archive::thread_pool;
+
+// Thread pool
+// https://www.geeksforgeeks.org/thread-pool-in-cpp/
+
+// probably gonna be the source of the most headaches
+// Wish there was a standard library for this
+
+Archive::ThreadPool::ThreadPool(size_t threads) : stop(false) {
+    if (threads == 0)
+        threads = std::thread::hardware_concurrency();
+    for (size_t i = 0; i < threads; ++i) {
+        workers.emplace_back([this] {
+            for (;;) {
+                std::function<void()> task;
+                {
+                    std::unique_lock<std::mutex> lock(this->queue_mutex);
+                    this->condition.wait(lock, [this] {
+                        return this->stop || !this->tasks.empty();
+                    });
+                    if (this->stop && this->tasks.empty())
+                        return;
+                    task = std::move(this->tasks.front());
+                    this->tasks.pop();
+                }
+                task();
+            }
+        });
+    }
+}
+
+Archive::ThreadPool::~ThreadPool() {
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        stop = true;
+    }
+    condition.notify_all();
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+}
+
+void Archive::ThreadPool::resize(size_t new_size) {
+    if (new_size == workers.size())
+        return;
+
+    // Stop current workers
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        stop = true;
+    }
+    condition.notify_all();
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+
+    // Clear and restart
+    workers.clear();
+    stop = false;
+
+    for (size_t i = 0; i < new_size; ++i) {
+        workers.emplace_back([this] {
+            for (;;) {
+                std::function<void()> task;
+                {
+                    std::unique_lock<std::mutex> lock(this->queue_mutex);
+                    this->condition.wait(lock, [this] {
+                        return this->stop || !this->tasks.empty();
+                    });
+                    if (this->stop && this->tasks.empty())
+                        return;
+                    task = std::move(this->tasks.front());
+                    this->tasks.pop();
+                }
+                task();
+            }
+        });
+    }
 }
 
 unique_ptr<Archive> Archive::create() {
@@ -31,7 +282,10 @@ unique_ptr<Archive> Archive::create() {
     archive->header.version = ARCHIVE_VERSION;
     archive->header.flags = static_cast<u8>(ArchiveFlag::None);
     archive->header.timestamp = static_cast<u64>(time(nullptr));
-    archive->lazy_loaded = false; // Created archives are not lazy loaded
+    archive->lazy_loaded = false;
+    // Created archives are not lazy loaded
+    // I will find a way to write files directly to the archive sometime later
+    // 🤓
     return archive;
 }
 
@@ -74,20 +328,15 @@ unique_ptr<Archive> Archive::load(const string &path) {
         file.read(reinterpret_cast<char *>(&file_entry.data_length),
                   sizeof(file_entry.data_length));
 
-        // Read the path string
         file_entry.path.resize(file_entry.path_length);
         file.read(file_entry.path.data(), (long)file_entry.path_length);
 
         archive->files.push_back(std::move(file_entry));
     }
 
-    // Record the position where data section starts for lazy loading
     u64 data_size = 0;
     file.read(reinterpret_cast<char *>(&data_size), sizeof(data_size));
     archive->data_section_offset = file.tellg();
-
-    // Don't load the actual data yet for lazy loading
-    // We'll validate CRC32 only when data is accessed
 
     return archive;
 }
@@ -100,7 +349,7 @@ unique_ptr<Archive> Archive::load_full(const string &path) {
     }
 
     auto archive = create();
-    archive->lazy_loaded = false; // Traditional full loading
+    archive->lazy_loaded = false;
 
     file.read(reinterpret_cast<char *>(&archive->header),
               sizeof(ArchiveHeader));
@@ -130,7 +379,6 @@ unique_ptr<Archive> Archive::load_full(const string &path) {
         file.read(reinterpret_cast<char *>(&file_entry.data_length),
                   sizeof(file_entry.data_length));
 
-        // Read the path string
         file_entry.path.resize(file_entry.path_length);
         file.read(file_entry.path.data(),
                   static_cast<streamsize>(file_entry.path_length));
@@ -138,7 +386,6 @@ unique_ptr<Archive> Archive::load_full(const string &path) {
         archive->files.push_back(std::move(file_entry));
     }
 
-    // Load all data immediately for traditional full loading
     u64 data_size = 0;
     file.read(reinterpret_cast<char *>(&data_size), sizeof(data_size));
     archive->data.resize(static_cast<size_t>(data_size));
@@ -146,13 +393,17 @@ unique_ptr<Archive> Archive::load_full(const string &path) {
               static_cast<streamsize>(data_size));
 
     // Validate CRC32 for full loading
+#ifdef __x86_64__
+    u32 actual_crc = crc32_simd(archive->data.data(),
+                                static_cast<size_t>(archive->data.size()));
+#else
     u32 actual_crc =
         crc32(archive->data.data(), static_cast<size_t>(archive->data.size()));
+#endif
     if (archive->header.crc32 != actual_crc) {
         cerr << "Archive CRC32 mismatch! The archive may be corrupted.\n";
         return nullptr;
     }
-
     return archive;
 }
 
@@ -167,12 +418,13 @@ ArchiveFile *Archive::add_file(const string &path) {
     // Normalize the path
     string normalized_path = normalize_path(path);
 
-    // If it's a directory, branch to add_directory
     if (fs::is_directory(normalized_path)) {
         return add_directory(normalized_path);
     }
 
     // Check if this file is already in the archive
+    // Todo!: implement a way to update files
+    // i can just add the offset difference to every file entry after it 💀
     auto existing =
         std::find_if(files.begin(), files.end(), [&](const ArchiveFile &f) {
             return f.path == normalized_path &&
@@ -204,8 +456,10 @@ ArchiveFile *Archive::add_file(const string &path) {
         static_cast<u8>((static_cast<u32>(perms)) & 0b111); // others
 
     if (fs::is_symlink(normalized_path)) {
+        // https://en.wikipedia.org/wiki/Symbolic_link
+        // symlink store the link target as data
+        // i thought they would be something on the filesystem but ok?
         file_entry.type = ArchiveFile::FileType::Symlink;
-        // For symlinks, store the target path as data
         string target = fs::read_symlink(normalized_path).string();
         file_entry.data_length = target.size();
         file_entry.size = file_entry.data_length + file_entry.path_length;
@@ -222,10 +476,41 @@ ArchiveFile *Archive::add_file(const string &path) {
             return nullptr;
         }
 
-        vector<u8> buffer(file_entry.data_length);
-        file.read(reinterpret_cast<char *>(buffer.data()),
-                  (long)file_entry.data_length);
-        data.insert(data.end(), buffer.begin(), buffer.end());
+        // Buffer read files in chunks to avoid larger allocations
+        // Note: i should make the size a build option
+        constexpr size_t BUFFER_SIZE = 1024UL * 1024UL;
+        const size_t file_size = file_entry.data_length;
+
+        // Reserve space for the data section
+        // "Might as well use an Arena" - 🤓
+        data.reserve(data.size() + file_size);
+
+        if (file_size <= BUFFER_SIZE) {
+            // smaller files, just read in one go
+            vector<u8> buffer(file_size);
+            file.read(reinterpret_cast<char *>(buffer.data()),
+                      static_cast<streamsize>(file_size));
+            data.insert(data.end(), buffer.begin(), buffer.end());
+        } else {
+
+            vector<u8> buffer(BUFFER_SIZE);
+            size_t remaining = file_size;
+
+            while (remaining > 0) {
+                size_t to_read = std::min(remaining, BUFFER_SIZE);
+                file.read(reinterpret_cast<char *>(buffer.data()),
+                          static_cast<streamsize>(to_read));
+
+                auto bytes_read = file.gcount();
+                if (bytes_read > 0) {
+                    data.insert(data.end(), buffer.begin(),
+                                buffer.begin() + bytes_read);
+                    remaining -= static_cast<size_t>(bytes_read);
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
     files.push_back(std::move(file_entry));
@@ -243,13 +528,9 @@ ArchiveFile *Archive::add_directory(const string &path) {
         return nullptr;
     }
 
-    // Normalize the path
     string normalized_path = normalize_path(path);
-
-    // Ensure all parent directories are added to the archive
     add_parent_directories(normalized_path);
 
-    // Check if this directory is already in the archive
     auto existing =
         std::find_if(files.begin(), files.end(), [&](const ArchiveFile &f) {
             return f.path == normalized_path &&
@@ -257,7 +538,6 @@ ArchiveFile *Archive::add_directory(const string &path) {
         });
 
     if (existing != files.end()) {
-        // Directory already exists, return pointer to it
         if (verbose) {
             cerr << "Directory already exists in archive, skipping: "
                  << normalized_path << '\n';
@@ -265,14 +545,15 @@ ArchiveFile *Archive::add_directory(const string &path) {
         return &(*existing);
     }
 
-    // First, add the directory entry itself
+    // create directory first
+    // Archive blows up if its not there :/
     ArchiveFile dir_entry;
     dir_entry.path = normalized_path;
     dir_entry.path_length = normalized_path.size();
     dir_entry.type = ArchiveFile::FileType::Directory;
-    dir_entry.data_length = 0;              // Directories have no data
-    dir_entry.offset = data.size();         // Current position in data
-    dir_entry.size = dir_entry.path_length; // Only path length for directories
+    dir_entry.data_length = 0;
+    dir_entry.offset = data.size();
+    dir_entry.size = dir_entry.path_length;
 
     auto perms = fs::status(normalized_path).permissions();
     dir_entry.permissions[0] =
@@ -285,15 +566,16 @@ ArchiveFile *Archive::add_directory(const string &path) {
     files.push_back(std::move(dir_entry));
     ArchiveFile *result = &files.back();
 
-    // Recursively add all contents of the directory
+    // Recursively add children
+    // "put them in the juvenile detention center" - 🤓
     try {
         for (const auto &entry : fs::directory_iterator(normalized_path)) {
             const string entry_path = entry.path().string();
 
             if (entry.is_directory()) {
-                add_directory(entry_path); // Recursive call for subdirectories
+                add_directory(entry_path);
             } else {
-                add_file(entry_path); // Add files and symlinks
+                add_file(entry_path);
             }
         }
     } catch (const fs::filesystem_error &e) {
@@ -307,7 +589,8 @@ ArchiveFile *Archive::add_directory(const string &path) {
 void Archive::add_parent_directories(const string &path) {
     fs::path file_path(path);
 
-    // Collect all parent directories
+    // Figure out parent directories so we can add those first
+    // Just the entry for parent directories
     vector<string> parent_dirs;
     fs::path current_parent = file_path.parent_path();
 
@@ -379,7 +662,11 @@ void Archive::remove_file(const string &path) {
 
 void Archive::compress(const string &output_path) const {
     ArchiveHeader header_copy = header;
+#ifdef __x86_64__
+    header_copy.crc32 = crc32_simd(data.data(), data.size());
+#else
     header_copy.crc32 = crc32(data.data(), data.size());
+#endif
 
     ofstream out(output_path, ios::binary);
     if (!out) {
@@ -429,7 +716,11 @@ void Archive::compress_parallel(const string &output_path,
     }
 
     ArchiveHeader header_copy = header;
+#ifdef __x86_64__
+    header_copy.crc32 = crc32_simd(data.data(), data.size());
+#else
     header_copy.crc32 = crc32(data.data(), data.size());
+#endif
 
     // First, write header and file table sequentially
     ofstream out(output_path, ios::binary);
@@ -467,26 +758,51 @@ void Archive::compress_parallel(const string &output_path,
     u64 data_start_offset = out.tellp();
 
     // Pre-allocate space for data section
-    out.seekp(data_start_offset + static_cast<std::streamoff>(data_size) - 1);
+    out.seekp((long)data_start_offset + static_cast<std::streamoff>(data_size) -
+              1);
     out.write("", 1);
     out.close();
 
-    // Now write data section in parallel using random access
+    // Now write data section in parallel using thread pool
     if (data_size > 0) {
-        vector<thread> workers;
-        workers.reserve(num_threads);
+        // Resize thread pool if needed
+        if (thread_pool.size() != num_threads) {
+            thread_pool.resize(num_threads);
+        }
+
         atomic<size_t> current_chunk{0};
         mutex error_mutex;
         bool has_error = false;
         string error_message;
 
-        // Calculate chunk size for parallel processing
-        const size_t min_chunk_size = 64 * 1024; // 64KB minimum chunk
-        const size_t chunk_size = std::max(
-            min_chunk_size, data_size / (static_cast<size_t>(num_threads) * 4));
+        // Calculate optimal chunk size for parallel processing
+        const size_t min_chunk_size =
+            256UL * 1024UL; // Increased to 256KB minimum
+        const size_t max_chunk_size = 8UL * 1024UL * 1024UL; // 8MB maximum
+
+        // Calculate chunk size based on data size and thread count
+        size_t optimal_chunk_size = data_size / (num_threads * 2);
+        optimal_chunk_size = std::max(
+            min_chunk_size, std::min(max_chunk_size, optimal_chunk_size));
+
+        const size_t chunk_size = optimal_chunk_size;
         const size_t total_chunks = (data_size + chunk_size - 1) / chunk_size;
 
-        auto worker = [&]() {
+        // Pre-open file descriptors for each thread to reduce overhead
+        vector<ofstream> thread_files(num_threads);
+        for (size_t i = 0; i < num_threads; ++i) {
+            thread_files[i].open(output_path, ios::binary | ios::in | ios::out);
+            if (!thread_files[i]) {
+                cerr << "Failed to open file for thread " << i << ": "
+                     << output_path << '\n';
+                return;
+            }
+        }
+
+        // Task function for thread pool
+        auto write_chunk_task = [&](size_t thread_id) {
+            ofstream &thread_file = thread_files[thread_id];
+
             while (true) {
                 size_t chunk_idx = current_chunk.fetch_add(1);
                 if (chunk_idx >= total_chunks)
@@ -498,41 +814,30 @@ void Archive::compress_parallel(const string &output_path,
                 size_t actual_chunk_size = chunk_end - chunk_start;
 
                 try {
-                    // Open file for random access writing
-                    ofstream chunk_out(output_path,
-                                       ios::binary | ios::in | ios::out);
-                    if (!chunk_out) {
-                        lock_guard<mutex> lock(error_mutex);
-                        has_error = true;
-                        error_message =
-                            "Failed to open file for parallel writing: " +
-                            output_path;
-                        return;
-                    }
-
                     // Seek to the correct position in the data section
-                    chunk_out.seekp(data_start_offset +
-                                    static_cast<std::streamoff>(chunk_start));
+                    thread_file.seekp(static_cast<streamsize>(
+                        data_start_offset + chunk_start));
 
                     // Write this chunk of data
-                    chunk_out.write(reinterpret_cast<const char *>(data.data() +
-                                                                   chunk_start),
-                                    static_cast<streamsize>(actual_chunk_size));
+                    thread_file.write(
+                        reinterpret_cast<const char *>(data.data() +
+                                                       chunk_start),
+                        static_cast<streamsize>(actual_chunk_size));
 
-                    if (!chunk_out.good()) {
+                    thread_file.flush(); // Ensure data is written
+
+                    if (!thread_file.good()) {
                         lock_guard<mutex> lock(error_mutex);
                         has_error = true;
                         error_message = "Failed to write data chunk";
                         return;
                     }
 
-                    chunk_out.close();
-
                     if (verbose) {
                         lock_guard<mutex> lock(error_mutex);
-                        cout << "Wrote chunk " << chunk_idx + 1 << "/"
-                             << total_chunks << " (" << actual_chunk_size
-                             << " bytes)" << '\n';
+                        cout << "Thread " << thread_id << " wrote chunk "
+                             << chunk_idx + 1 << "/" << total_chunks << " ("
+                             << actual_chunk_size << " bytes)" << '\n';
                     }
                 } catch (const exception &e) {
                     lock_guard<mutex> lock(error_mutex);
@@ -543,14 +848,22 @@ void Archive::compress_parallel(const string &output_path,
             }
         };
 
-        // Start worker threads
+        // Submit tasks to thread pool
+        vector<future<void>> futures;
+        futures.reserve(num_threads);
+
         for (size_t i = 0; i < num_threads; ++i) {
-            workers.emplace_back(worker);
+            futures.push_back(thread_pool.enqueue(write_chunk_task, i));
         }
 
-        // Wait for all workers to complete
-        for (auto &w : workers) {
-            w.join();
+        // Wait for all tasks to complete
+        for (auto &future : futures) {
+            future.wait();
+        }
+
+        // Close all thread files
+        for (auto &file : thread_files) {
+            file.close();
         }
 
         // Check for errors
@@ -560,7 +873,8 @@ void Archive::compress_parallel(const string &output_path,
         }
 
         if (verbose) {
-            cout << "Parallel compression completed successfully using "
+            cout << "Parallel compression completed successfully using thread "
+                    "pool with "
                  << num_threads << " threads" << '\n';
         }
     }
@@ -718,8 +1032,8 @@ void Archive::decompress_parallel(size_t num_threads) {
         }
     }
 
-    // Worker function for extracting files
-    auto extract_worker = [&](size_t start_idx, size_t end_idx) {
+    // Worker function for extracting files using thread pool
+    auto extract_task = [&](size_t start_idx, size_t end_idx) {
         for (size_t i = start_idx; i < end_idx; ++i) {
             const auto &file_entry = files[i];
 
@@ -813,8 +1127,15 @@ void Archive::decompress_parallel(size_t num_threads) {
         }
     };
 
-    // Divide work among threads
-    std::vector<std::thread> workers;
+    // Resize thread pool if needed
+    if (thread_pool.size() != num_threads) {
+        thread_pool.resize(num_threads);
+    }
+
+    // Divide work among thread pool tasks
+    std::vector<std::future<void>> futures;
+    futures.reserve(num_threads);
+
     size_t files_per_thread = files.size() / num_threads;
     size_t remaining_files = files.size() % num_threads;
 
@@ -832,13 +1153,14 @@ void Archive::decompress_parallel(size_t num_threads) {
         }
 
         if (start_idx < files.size()) {
-            workers.emplace_back(extract_worker, start_idx,
-                                 std::min(end_idx, files.size()));
+            futures.push_back(thread_pool.enqueue(
+                extract_task, start_idx, std::min(end_idx, files.size())));
         }
     }
 
-    for (auto &worker : workers) {
-        worker.join();
+    // Wait for all tasks to complete
+    for (auto &future : futures) {
+        future.wait();
     }
 
     if (verbose) {
@@ -933,22 +1255,50 @@ void Archive::load_file_data_if_needed() {
         return;
     }
 
-    // Seek to data section
-    file.seekg(static_cast<streamoff>(data_section_offset));
-
-    // Read data size (it was already read during initial load but we need to
-    // skip it)
+    // Read data size first
     u64 data_size = 0;
     file.seekg(static_cast<streamoff>(data_section_offset - sizeof(u64)));
     file.read(reinterpret_cast<char *>(&data_size), sizeof(data_size));
 
-    // Now read the actual data
+    // Optimize memory allocation with reserve
+    data.clear();
+    data.reserve(static_cast<size_t>(data_size));
     data.resize(static_cast<size_t>(data_size));
-    file.read(reinterpret_cast<char *>(data.data()),
-              static_cast<streamsize>(data_size));
+
+    // Seek to data section and read with larger buffer for better I/O
+    // performance
+    file.seekg(static_cast<streamoff>(data_section_offset));
+
+    constexpr size_t READ_BUFFER_SIZE = 2UL * 1024UL * 1024UL; // 2MB buffer
+    if (data_size <= READ_BUFFER_SIZE) {
+        // Small data: read in one go
+        file.read(reinterpret_cast<char *>(data.data()),
+                  static_cast<streamsize>(data_size));
+    } else {
+        // Large data: read in chunks
+        size_t remaining = static_cast<size_t>(data_size);
+        size_t offset = 0;
+
+        while (remaining > 0) {
+            size_t to_read = std::min(remaining, READ_BUFFER_SIZE);
+            file.read(reinterpret_cast<char *>(data.data() + offset),
+                      static_cast<streamsize>(to_read));
+
+            auto bytes_read = file.gcount();
+            if (bytes_read <= 0)
+                break;
+
+            offset += static_cast<size_t>(bytes_read);
+            remaining -= static_cast<size_t>(bytes_read);
+        }
+    }
 
     // Validate CRC32 now that we have the data
+#ifdef __x86_64__
+    u32 actual_crc = crc32_simd(data.data(), static_cast<size_t>(data.size()));
+#else
     u32 actual_crc = crc32(data.data(), static_cast<size_t>(data.size()));
+#endif
     if (header.crc32 != actual_crc) {
         cerr << "Archive CRC32 mismatch! The archive may be corrupted.\n";
         data.clear(); // Clear potentially corrupted data
@@ -974,13 +1324,46 @@ const std::vector<u8> Archive::get_file_data(const ArchiveFile &file) const {
             return {};
         }
 
+        // Optimize buffer allocation using memory pool for large files
+        const size_t file_size = static_cast<size_t>(file.data_length);
+        std::vector<u8> file_data;
+
+        if (file_size > 1024UL * 1024UL) { // Use memory pool for files > 1MB
+            file_data = memory_pool.get_buffer(file_size);
+            file_data.resize(file_size);
+        } else {
+            file_data.resize(file_size);
+        }
+
         // Seek to the file's data position
         u64 absolute_offset = data_section_offset + file.offset;
         archive_file.seekg(static_cast<streamoff>(absolute_offset));
 
-        std::vector<u8> file_data(static_cast<size_t>(file.data_length));
-        archive_file.read(reinterpret_cast<char *>(file_data.data()),
-                          static_cast<streamsize>(file.data_length));
+        // Read with optimized I/O for large files
+        if (file_size <= 64UL * 1024UL) { // 64KB threshold
+            // Small files: single read
+            archive_file.read(reinterpret_cast<char *>(file_data.data()),
+                              static_cast<streamsize>(file_size));
+        } else {
+            // Large files: chunked read for better I/O performance
+            constexpr size_t CHUNK_SIZE = 64UL * 1024UL; // 64KB chunks
+            size_t remaining = file_size;
+            size_t offset = 0;
+
+            while (remaining > 0) {
+                size_t to_read = std::min(remaining, CHUNK_SIZE);
+                archive_file.read(
+                    reinterpret_cast<char *>(file_data.data() + offset),
+                    static_cast<streamsize>(to_read));
+
+                auto bytes_read = archive_file.gcount();
+                if (bytes_read <= 0)
+                    break;
+
+                offset += static_cast<size_t>(bytes_read);
+                remaining -= static_cast<size_t>(bytes_read);
+            }
+        }
 
         if (verbose) {
             cout << "Lazy loaded " << file.data_length
@@ -996,14 +1379,22 @@ const std::vector<u8> Archive::get_file_data(const ArchiveFile &file) const {
             return {};
         }
 
-        std::vector<u8> file_data(static_cast<size_t>(file.data_length));
-        auto start_it =
-            data.begin() +
-            static_cast<std::vector<u8>::difference_type>(file.offset);
-        auto end_it =
-            data.begin() + static_cast<std::vector<u8>::difference_type>(
-                               file.offset + file.data_length);
-        std::copy(start_it, end_it, file_data.begin());
+        // Use more efficient memory copy for large files
+        const size_t file_size = static_cast<size_t>(file.data_length);
+        std::vector<u8> file_data;
+
+        if (file_size > 1024UL * 1024UL) {
+            file_data = memory_pool.get_buffer(file_size);
+            file_data.resize(file_size);
+        } else {
+            file_data.resize(file_size);
+        }
+
+        // Use optimized memory copy for better performance on large files
+        if (file_size > 0) {
+            fast_memcpy(file_data.data(), data.data() + file.offset, file_size);
+        }
+
         return file_data;
     }
 }

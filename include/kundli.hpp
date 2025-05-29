@@ -1,9 +1,23 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
 #include <vector>
+
+// Memory mapping support for large files
+#ifdef __unix__
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 using u8 = std::uint8_t;
 using u16 = std::uint16_t;
@@ -79,6 +93,27 @@ class Archive {
     const std::vector<u8> get_file_data(const std::string &file_path) const;
     bool is_loaded() const { return lazy_loaded; }
 
+    // Memory mapping for large files
+    class MappedFile {
+      public:
+        MappedFile() = default;
+        ~MappedFile();
+
+        bool map_file(const std::string &path);
+        void unmap();
+
+        const u8 *data() const { return mapped_data; }
+        size_t size() const { return file_size; }
+        bool is_mapped() const { return mapped_data != nullptr; }
+
+      private:
+#ifdef __unix__
+        int fd = -1;
+#endif
+        u8 *mapped_data = nullptr;
+        size_t file_size = 0;
+    };
+
     // Threading configuration
     void set_thread_count(size_t count) { thread_count = count; }
     size_t get_thread_count() const { return thread_count; }
@@ -100,6 +135,78 @@ class Archive {
     u64 data_section_offset{0};
     bool lazy_loaded{false};
 
+    // Memory mapping for very large archives (>100MB)
+    mutable MappedFile mapped_archive;
+    static constexpr size_t MMAP_THRESHOLD = 100UL * 1024UL * 1024UL; // 100MB
+
     // Threading support
     size_t thread_count{0}; // 0 means auto-detect
+
+    // Memory pool for better allocation performance
+    struct MemoryPool {
+        std::vector<std::vector<u8>> buffers;
+        std::mutex pool_mutex;
+
+        std::vector<u8> get_buffer(size_t size) {
+            std::lock_guard<std::mutex> lock(pool_mutex);
+            for (auto it = buffers.begin(); it != buffers.end(); ++it) {
+                if (it->size() >= size && it->capacity() <= size * 2) {
+                    auto result = std::move(*it);
+                    buffers.erase(it);
+                    return result;
+                }
+            }
+            return std::vector<u8>(size);
+        }
+
+        void return_buffer(std::vector<u8> buffer) {
+            std::lock_guard<std::mutex> lock(pool_mutex);
+            if (buffers.size() < 10) { // Limit pool size
+                buffer.clear();
+                buffers.push_back(std::move(buffer));
+            }
+        }
+    };
+
+    static MemoryPool memory_pool;
+
+    // Thread pool for better parallel processing
+    class ThreadPool {
+      public:
+        ThreadPool(size_t threads = std::thread::hardware_concurrency());
+        ~ThreadPool();
+
+        template <class F, class... Args>
+        auto enqueue(F &&f, Args &&...args)
+            -> std::future<typename std::result_of<F(Args...)>::type> {
+            using return_type = typename std::result_of<F(Args...)>::type;
+
+            auto task = std::make_shared<std::packaged_task<return_type()>>(
+                std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+
+            std::future<return_type> res = task->get_future();
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                if (stop) {
+                    throw std::runtime_error("enqueue on stopped ThreadPool");
+                }
+                tasks.emplace([task]() { (*task)(); });
+            }
+            condition.notify_one();
+            return res;
+        }
+
+        void resize(size_t new_size);
+        size_t size() const { return workers.size(); }
+
+      private:
+        std::vector<std::thread> workers;
+        std::queue<std::function<void()>> tasks;
+
+        std::mutex queue_mutex;
+        std::condition_variable condition;
+        std::atomic<bool> stop;
+    };
+
+    static ThreadPool thread_pool;
 };
